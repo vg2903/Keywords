@@ -1,17 +1,17 @@
 # app_semrush_like.py
 # 🚀 Semrush-like Keyword Explorer (Free) — Streamlit
-# - Country selector for region-specific suggestions (Google/Bing/YouTube)
+# - Country selector (Google/Bing/YouTube)
 # - Attribute-driven refinement (brands/specs/features/units)
-# - Preset packs (Power Tools, Garden Tools)
-# - Multi-source autocomplete (Google, Bing, YouTube, Amazon*)
-# - A–Z / 0–9 expansion, prefix/suffix expansion
-# - Optional PAA + Related Searches (best-effort)
-# - Long-tail filters, include/exclude, regex filters
-# - Intent labeling + clustering
-# - CSV export
+# - Preset packs + Data sources (Manual / CSV upload / Google Sheet CSV)
+# - Templates to manufacture structured long-tails
+# - Numeric range DSL to auto-generate specs
+# - Synonyms (canonicalization/expansion)
+# - Multi-source validation (consensus)
+# - Filters, intent, clustering, CSV export
 
 import streamlit as st
 import requests, time, re
+from functools import lru_cache
 from bs4 import BeautifulSoup
 import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -28,7 +28,7 @@ except Exception:
 
 st.set_page_config(page_title="Semrush-like Keyword Explorer (Free)", page_icon="🧠", layout="wide")
 st.title("🧠 Semrush-like Keyword Explorer (Free)")
-st.caption("Tip: Start with a single seed to explore widely, then paste many seeds for batch mode.")
+st.caption("Start with a single seed to explore widely, then paste many seeds for batch mode.")
 
 # ---------------------- Config ----------------------
 HEADERS = {
@@ -135,31 +135,11 @@ COMMON_PREFIXES = ["best", "cheap", "top", "how to use", "types of", "difference
 
 def expansions(seed: str, breadth: int = 120):
     exps = [seed]
-    # suffix A–Z/0–9
-    exps += [f"{seed} {c}" for c in ALPHANUM]
-    # prefix A–Z/0–9
-    exps += [f"{c} {seed}" for c in ALPHANUM]
-    # common suffixes/prefixes
+    exps += [f"{seed} {c}" for c in ALPHANUM]   # suffix A–Z/0–9
+    exps += [f"{c} {seed}" for c in ALPHANUM]   # prefix A–Z/0–9
     exps += [f"{seed} {s}" for s in COMMON_SUFFIXES]
     exps += [f"{p} {seed}" for p in COMMON_PREFIXES]
-    # dedupe, cap
     return list(dict.fromkeys(exps))[:breadth]
-
-def fetch_from_sources(query: str, sources: list[str], country: str = "us"):
-    acc = []
-    if "Google" in sources:
-        acc += google_suggest(query, country=country)
-        time.sleep(DELAY)
-    if "Bing" in sources:
-        acc += bing_suggest(query, country=country)
-        time.sleep(DELAY)
-    if "YouTube" in sources:
-        acc += youtube_suggest(query, country=country)
-        time.sleep(DELAY)
-    if "Amazon" in sources:
-        acc += amazon_suggest(query)
-        time.sleep(DELAY)
-    return acc
 
 def classify_intent(kw: str) -> str:
     k = kw.lower()
@@ -194,10 +174,8 @@ def apply_filters(df: pd.DataFrame, min_words: int, max_words: int|None, include
         if w < min_words: return False
         if max_words and max_words > 0 and w > max_words: return False
         low = kw.lower()
-        if include_terms:
-            if not any(t in low for t in include_terms): return False
-        if exclude_terms:
-            if any(t in low for t in exclude_terms): return False
+        if include_terms and not any(t in low for t in include_terms): return False
+        if exclude_terms and any(t in low for t in exclude_terms): return False
         if regex_inc:
             try:
                 if not re.search(regex_inc, kw, flags=re.IGNORECASE): return False
@@ -217,27 +195,20 @@ def _to_list(txt: str):
 def generate_attribute_candidates(seed: str, brands: list[str], specs: list[str], features: list[str]) -> list[str]:
     seed = seed.strip()
     cands = set()
-
-    # Brand + Spec + Seed  (e.g., "makita 36v whipper snipper")
     for b in brands:
         for s in specs:
             cands.add(f"{b} {s} {seed}")
             cands.add(f"{s} {b} {seed}")
-
-    # Brand + Seed (+ Feature)
     for b in brands:
         cands.add(f"{b} {seed}")
         for f in features:
             cands.add(f"{b} {seed} {f}")
             cands.add(f"{b} {f} {seed}")
-
-    # Spec + Seed and Feature + Seed
     for s in specs:
         cands.add(f"{s} {seed}")
     for f in features:
         cands.add(f"{f} {seed}")
         cands.add(f"{seed} {f}")
-
     return list(cands)
 
 def count_attribute_hits(text: str, tokens: list[str]) -> int:
@@ -251,14 +222,55 @@ def has_unit(text: str, units: list[str]) -> bool:
     tl = text.lower()
     return any(re.search(rf"\b{re.escape(u)}\b", tl) for u in units)
 
-# ---------------------- UI ----------------------
+# ---------------------- Caching & validation ----------------------
+def fetch_from_sources(query: str, sources: list[str], country: str = "us"):
+    acc = []
+    if "Google" in sources:
+        acc += google_suggest(query, country=country)
+        time.sleep(DELAY)
+    if "Bing" in sources:
+        acc += bing_suggest(query, country=country)
+        time.sleep(DELAY)
+    if "YouTube" in sources:
+        acc += youtube_suggest(query, country=country)
+        time.sleep(DELAY)
+    if "Amazon" in sources:
+        acc += amazon_suggest(query)
+        time.sleep(DELAY)
+    return acc
+
+@lru_cache(maxsize=20000)
+def cached_suggest_single_source(query: str, source: str, country: str):
+    if source == "Google":
+        return tuple(google_suggest(query, country=country))
+    if source == "Bing":
+        return tuple(bing_suggest(query, country=country))
+    if source == "YouTube":
+        return tuple(youtube_suggest(query, country=country))
+    if source == "Amazon":
+        return tuple(amazon_suggest(query))
+    return tuple()
+
+def validate_keyword(phrase: str, country: str, require_sources=2, sources=("Google","Bing","YouTube")) -> bool:
+    """Keep only if the exact phrase is confirmed by >= require_sources among the given sources."""
+    hits = 0
+    plow = phrase.strip().lower()
+    for src in sources:
+        suggs = cached_suggest_single_source(phrase, src, country)
+        if any(plow == s.strip().lower() for s in suggs):
+            hits += 1
+        if hits >= require_sources:
+            return True
+    return False
+
+# ---------------------- UI: Settings & Sources ----------------------
 with st.expander("⚙️ Settings & Sources", expanded=True):
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         sources = st.multiselect("Sources", ["Google","Bing","YouTube","Amazon"], default=["Google","Bing","YouTube"])
         breadth = st.slider("Expansion breadth per seed", 40, 240, 140, 10)
         min_per_seed = st.slider("Min suggestions per seed (best effort)", 10, 150, 40, 5)
-        country = st.selectbox("Country (influences Google/Bing/YouTube)", ["us","au","in","uk","ca","de","fr","it","es","nl"], index=0)
+        country = st.selectbox("Country (affects Google/Bing/YouTube)", ["us","au","in","uk","ca","de","fr","it","es","nl"], index=0)
     with c2:
         min_words = st.slider("Minimum words", 2, 6, 3, 1)
         max_words = st.slider("Maximum words (0 = no max)", 0, 10, 0, 1)
@@ -273,7 +285,29 @@ with st.expander("⚙️ Settings & Sources", expanded=True):
         cluster_target = st.slider("Target clusters", 2, 50, 12, 1)
         fetch_paa = st.checkbox("Enrich with Google Related & PAA (experimental)", False)
 
-# ---------------------- Attribute-driven refinement panel ----------------------
+# ---------------------- UI: Data sources (attributes at scale) ----------------------
+with st.expander("📚 Data sources (attributes at scale)", expanded=False):
+    mode = st.radio("Load attributes from", ["Manual lists", "Upload CSV", "Google Sheet (CSV URL)"], horizontal=True)
+    uploaded_attrs = None
+    sheet_url = ""
+    if mode == "Upload CSV":
+        uploaded_attrs = st.file_uploader("Upload CSV with columns: type,value   (type in: brand, spec, feature, unit)", type=["csv"])
+    elif mode == "Google Sheet (CSV URL)":
+        sheet_url = st.text_input("Paste CSV export URL of your Google Sheet")
+
+def load_attributes_from_csv(file_or_url):
+    df = pd.read_csv(file_or_url)
+    # Expect columns: type,value. type in {"brand","spec","feature","unit"}
+    out = {"brand": set(), "spec": set(), "feature": set(), "unit": set()}
+    if "type" in df.columns and "value" in df.columns:
+        for _, row in df.iterrows():
+            t = str(row["type"]).strip().lower()
+            v = str(row["value"]).strip().lower()
+            if t in out and v:
+                out[t].add(v)
+    return {k: sorted(v) for k, v in out.items()}
+
+# ---------------------- UI: Attribute-driven refinement panel ----------------------
 with st.expander("🎯 Attribute-driven refinement (brands/specs/features)", expanded=True):
     colA, colB, colC, colD = st.columns(4)
 
@@ -292,7 +326,7 @@ with st.expander("🎯 Attribute-driven refinement (brands/specs/features)", exp
             "units": "v, volt, volts, gauge, mm, inch, ah"
         },
         "Garden Tools": {
-            "brands": "husqvarna\nmakita\ndevalt\nstihl\nego\ngreenworks\nryobi",
+            "brands": "husqvarna\nmakita\ndewalt\nstihl\nego\ngreenworks\nryobi",
             "specs": "18v\n36v\n40v\n58v\n2 stroke\n4 stroke\n25cc\n30cc\n40cc",
             "features": "cordless\nbattery operated\nmetal blade\nline\nstring\nwith wheels\nstraight shaft",
             "units": "v, volt, volts, cc, stroke, inch, mm"
@@ -333,46 +367,209 @@ with st.expander("🎯 Attribute-driven refinement (brands/specs/features)", exp
         features_text = st.text_area("Features (one per line)", st.session_state["features_text"], height=160, key="features_text")
         units_text = st.text_input("Units (comma-separated)", st.session_state["units_text"], key="units_text")
 
+# ---------------------- UI: Templates (power users) ----------------------
+with st.expander("🧩 Templates (power user)", expanded=False):
+    templates_text = st.text_area(
+        "One template per line. Use {seed}, {brand}, {spec}, {feature}.\n"
+        "Examples:\n"
+        "{brand} {spec} {seed}\n{spec} {seed} for {feature}\n{brand} {seed}\n{spec} {seed}",
+        "{brand} {spec} {seed}\n{spec} {seed}\n{brand} {seed} {feature}",
+        height=140
+    )
+
+def render_templates(templates, seed, brands, specs, features, limit_per_template=5000):
+    out = set()
+    for tpl in templates:
+        tpl = tpl.strip()
+        if not tpl:
+            continue
+        has_brand   = "{brand}"   in tpl
+        has_spec    = "{spec}"    in tpl
+        has_feature = "{feature}" in tpl
+
+        b_iter = brands   if has_brand   else [None]
+        s_iter = specs    if has_spec    else [None]
+        f_iter = features if has_feature else [None]
+
+        count = 0
+        for b in b_iter:
+            for s in s_iter:
+                for f in f_iter:
+                    phrase = tpl.replace("{seed}", seed)
+                    if b is not None: phrase = phrase.replace("{brand}", b)
+                    if s is not None: phrase = phrase.replace("{spec}", s)
+                    if f is not None: phrase = phrase.replace("{feature}", f)
+                    phrase = re.sub(r"\s+", " ", phrase).strip()
+                    out.add(phrase)
+                    count += 1
+                    if count >= limit_per_template:
+                        break
+                if count >= limit_per_template: break
+            if count >= limit_per_template: break
+    return list(out)
+
+# ---------------------- UI: Auto-generate specs (ranges & lists) ----------------------
+with st.expander("🔢 Auto-generate specs (ranges & lists)", expanded=False):
+    gen_specs = st.text_area(
+        "Describe ranges/lists. Examples:\n"
+        "volts=10-60 step 2 suffix \"v\"\n"
+        "gauge=15,16,18,23 suffix \" gauge\"",
+        "",
+        height=120
+    )
+
+def parse_generators(gen_text):
+    specs = []
+    for line in gen_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # pattern: name=START-END step N suffix "txt"
+        m = re.match(r".*?=(\d+)\s*-\s*(\d+)\s*step\s*(\d+)\s*suffix\s*\"([^\"]+)\"", line, flags=re.I)
+        if m:
+            start, end, step, suf = int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4)
+            for n in range(start, end+1, step):
+                specs.append(f"{n}{suf}")
+        else:
+            # Comma list with suffix: name=15,16,18 suffix " gauge"
+            m2 = re.match(r".*?=([\d,\s]+)\s*suffix\s*\"([^\"]+)\"", line, flags=re.I)
+            if m2:
+                nums = [x.strip() for x in m2.group(1).split(",") if x.strip()]
+                suf = m2.group(2)
+                for n in nums:
+                    specs.append(f"{n}{suf}")
+    return specs
+
+# ---------------------- UI: Synonyms ----------------------
+with st.expander("🔁 Synonyms (optional)", expanded=False):
+    synonyms_text = st.text_area("Pairs: canonical: a|b|c", "whipper snipper: line trimmer|string trimmer", height=100)
+
+def parse_synonyms(txt):
+    synmap = {}
+    for line in txt.splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        canon, alts = line.split(":", 1)
+        alts = [a.strip().lower() for a in re.split(r"[|,]", alts) if a.strip()]
+        synmap[canon.strip().lower()] = alts
+    return synmap
+
+def expand_with_synonyms(seed, synmap):
+    out = {seed}
+    sl = seed.lower().strip()
+    for canon, alts in synmap.items():
+        if sl == canon or sl in alts:
+            out |= set([canon] + alts)
+    return sorted(out)
+
+# ---------------------- Seed expansion core ----------------------
 def expand_seed(seed: str):
     out_rows = []
     got = set()
 
-    # Parse attribute lists from UI
-    brands = _to_list(st.session_state["brands_text"])
-    specs = _to_list(st.session_state["specs_text"])
-    features = _to_list(st.session_state["features_text"])
-    units = _to_list(st.session_state["units_text"])
+    # Merge attributes from manual + external sources
+    brands_manual   = _to_list(st.session_state["brands_text"])
+    specs_manual    = _to_list(st.session_state["specs_text"])
+    features_manual = _to_list(st.session_state["features_text"])
+    units_manual    = _to_list(st.session_state["units_text"])
 
-    # 1) Attribute-driven candidate generation + validation
-    if use_attr_mode:
-        attr_candidates = generate_attribute_candidates(seed, brands, specs, features)
-        for cand in attr_candidates:
-            suggs = fetch_from_sources(cand, sources, country=country)
-            for s in suggs:
-                sl = s.lower().strip()
-                if not sl or sl in got:
-                    continue
+    ext = {"brand": [], "spec": [], "feature": [], "unit": []}
+    if mode == "Upload CSV" and uploaded_attrs is not None:
+        try:
+            ext = load_attributes_from_csv(uploaded_attrs)
+        except Exception:
+            st.warning("Could not read uploaded CSV. Ensure columns: type,value")
+    elif mode == "Google Sheet (CSV URL)" and sheet_url.strip():
+        try:
+            ext = load_attributes_from_csv(sheet_url.strip())
+        except Exception:
+            st.warning("Could not load Google Sheet CSV. Check URL/permissions.")
 
-                # Enforce attribute richness
-                hits = 0
-                hits += count_attribute_hits(sl, brands)
-                hits += count_attribute_hits(sl, specs)
-                hits += count_attribute_hits(sl, features)
+    brands   = sorted(set(brands_manual)   | set(ext["brand"]))
+    specs    = sorted(set(specs_manual)    | set(ext["spec"]))
+    features = sorted(set(features_manual) | set(ext["feature"]))
+    units    = sorted(set(units_manual)    | set(ext["unit"]))
 
-                if hits < min_attrs_required:
-                    continue
-                if require_number and not has_number(sl):
-                    continue
-                if require_unit and units and not has_unit(sl, units):
-                    continue
+    # Inject generated specs
+    gen_specs_list = parse_generators(gen_specs)
+    if gen_specs_list:
+        specs = sorted(set(specs) | set([s.lower() for s in gen_specs_list]))
 
-                got.add(sl)
-                out_rows.append({"Keyword": s.strip(), "Seed": seed, "SourceQuery": cand})
+    # Synonyms
+    synmap = parse_synonyms(synonyms_text)
+    seed_variants = expand_with_synonyms(seed, synmap)
 
+    # Templates (if any)
+    templates = [t for t in templates_text.splitlines() if t.strip()]
+
+    # 1) Attribute-driven candidates from templates
+    if use_attr_mode and templates:
+        for seed_variant in seed_variants:
+            cand_templates = render_templates(templates, seed_variant, brands, specs, features, limit_per_template=8000)
+            for cand in cand_templates:
+                suggs = fetch_from_sources(cand, sources, country=country)
+                for s in suggs:
+                    sl = s.lower().strip()
+                    if not sl or sl in got: 
+                        continue
+
+                    # Attribute gating
+                    hits = 0
+                    hits += count_attribute_hits(sl, brands)
+                    hits += count_attribute_hits(sl, specs)
+                    hits += count_attribute_hits(sl, features)
+
+                    if hits < min_attrs_required:
+                        continue
+                    if require_number and not has_number(sl):
+                        continue
+                    if require_unit and units and not has_unit(sl, units):
+                        continue
+
+                    # Multi-source validation (optional; stricter)
+                    if not validate_keyword(s, country, require_sources=2):
+                        continue
+
+                    got.add(sl)
+                    out_rows.append({"Keyword": s.strip(), "Seed": seed, "SourceQuery": cand})
+                if len(out_rows) >= min_per_seed:
+                    break
             if len(out_rows) >= min_per_seed:
                 break
 
-    # 2) Fallback to broad expansions if we still need more
+    # 2) Attribute combinator (brand/spec/feature mixing) if templates didn't fill enough
+    if use_attr_mode and len(out_rows) < min_per_seed:
+        for seed_variant in seed_variants:
+            attr_candidates = generate_attribute_candidates(seed_variant, brands, specs, features)
+            for cand in attr_candidates:
+                suggs = fetch_from_sources(cand, sources, country=country)
+                for s in suggs:
+                    sl = s.lower().strip()
+                    if not sl or sl in got:
+                        continue
+
+                    hits = 0
+                    hits += count_attribute_hits(sl, brands)
+                    hits += count_attribute_hits(sl, specs)
+                    hits += count_attribute_hits(sl, features)
+                    if hits < min_attrs_required:
+                        continue
+                    if require_number and not has_number(sl):
+                        continue
+                    if require_unit and units and not has_unit(sl, units):
+                        continue
+                    if not validate_keyword(s, country, require_sources=2):
+                        continue
+
+                    got.add(sl)
+                    out_rows.append({"Keyword": s.strip(), "Seed": seed, "SourceQuery": cand})
+                if len(out_rows) >= min_per_seed:
+                    break
+            if len(out_rows) >= min_per_seed:
+                break
+
+    # 3) Fallback: broad expansions
     if len(out_rows) < min_per_seed:
         exps = expansions(seed, breadth=breadth)
         for ex in exps:
@@ -386,7 +583,7 @@ def expand_seed(seed: str):
             if len(out_rows) >= min_per_seed:
                 break
 
-    # 3) Optional PAA/Related enrichment
+    # 4) Optional PAA/Related enrichment
     if fetch_paa and len(out_rows) < min_per_seed:
         more = google_related_and_paa(seed)
         for s in more:
@@ -503,4 +700,4 @@ if run_multi:
     st.download_button("⬇️ Download CSV", data=csv, file_name="keywords_batch.csv", mime="text/csv")
 
 st.markdown("---")
-st.caption("⚠️ Endpoints are unofficial. Use modest rates and consider proxies for larger runs. Some sources (e.g., Amazon) are regionally restricted.")
+st.caption("⚠️ Endpoints are unofficial. Use modest rates and consider proxies for larger runs. For large CSV/Sheet lists, start with smaller breadth and loosen filters gradually.")
