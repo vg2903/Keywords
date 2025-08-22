@@ -1,5 +1,6 @@
 # app_semrush_like.py
 # 🚀 Semrush-like Keyword Explorer (Free) — Streamlit
+# - Country selector for region-specific suggestions (Google/Bing/YouTube)
 # - Enter one or many seeds
 # - Multi-source autocomplete (Google, Bing, YouTube, Amazon*)
 # - A–Z / 0–9 expansion, prefix/suffix expansion
@@ -7,13 +8,13 @@
 # - Long-tail filters, include/exclude lists, regex filters
 # - Intent labeling + clustering
 # - CSV export
-# NOTE: Respect websites' terms of service. Use reasonable rates and proxies if needed.
 
 import streamlit as st
-import requests, time, re, math, html
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests, time, re
 from bs4 import BeautifulSoup
 import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.cluster import KMeans
 
 # Optional embeddings
 USE_EMBEDDINGS = False
@@ -24,13 +25,9 @@ try:
 except Exception:
     pass
 
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.cluster import KMeans
-
 st.set_page_config(page_title="Semrush-like Keyword Explorer (Free)", page_icon="🧠", layout="wide")
 st.title("🧠 Semrush-like Keyword Explorer (Free)")
-
-st.caption("Tip: Start with a **single seed** to explore widely, then paste in many seeds for batch mode.")
+st.caption("Tip: Start with a single seed to explore widely, then paste many seeds for batch mode.")
 
 # ---------------------- Config ----------------------
 HEADERS = {
@@ -39,9 +36,14 @@ HEADERS = {
 DELAY = 0.15  # polite delay between calls
 
 # ---------------------- Suggest endpoints ----------------------
-def google_suggest(q: str):
+def google_suggest(q: str, country: str = "us"):
+    """Google Autocomplete (unofficial). hl=language, gl=country."""
     try:
-        r = requests.get(f"https://suggestqueries.google.com/complete/search?client=firefox&q={q}", timeout=8)
+        r = requests.get(
+            "https://suggestqueries.google.com/complete/search",
+            params={"client": "firefox", "q": q, "hl": country.lower(), "gl": country.upper()},
+            timeout=8
+        )
         r.raise_for_status()
         data = r.json()
         if isinstance(data, list) and len(data) > 1:
@@ -50,9 +52,14 @@ def google_suggest(q: str):
         pass
     return []
 
-def bing_suggest(q: str):
+def bing_suggest(q: str, country: str = "us"):
+    """Bing Autocomplete (unofficial). mkt=en-COUNTRY."""
     try:
-        r = requests.get(f"https://api.bing.com/osjson.aspx?query={q}", timeout=8)
+        r = requests.get(
+            "https://api.bing.com/osjson.aspx",
+            params={"query": q, "mkt": f"en-{country.upper()}"},
+            timeout=8
+        )
         r.raise_for_status()
         data = r.json()
         if isinstance(data, list) and len(data) > 1:
@@ -61,9 +68,14 @@ def bing_suggest(q: str):
         pass
     return []
 
-def youtube_suggest(q: str):
+def youtube_suggest(q: str, country: str = "us"):
+    """YouTube Autocomplete (unofficial). hl/gl like Google."""
     try:
-        r = requests.get(f"https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&q={q}", timeout=8)
+        r = requests.get(
+            "https://suggestqueries.google.com/complete/search",
+            params={"client": "firefox", "ds": "yt", "q": q, "hl": country.lower(), "gl": country.upper()},
+            timeout=8
+        )
         r.raise_for_status()
         data = r.json()
         if isinstance(data, list) and len(data) > 1:
@@ -73,10 +85,11 @@ def youtube_suggest(q: str):
     return []
 
 def amazon_suggest(q: str):
-    # Amazon is regional and rate-limited; this endpoint may not always respond.
+    """Amazon suggestions (region-dependent; may rate-limit)."""
     try:
         r = requests.get(
-            f"https://completion.amazon.com/api/2017/suggestions?limit=11&prefix={q}&alias=aps",
+            "https://completion.amazon.com/api/2017/suggestions",
+            params={"limit": 11, "prefix": q, "alias": "aps"},
             timeout=8,
             headers=HEADERS
         )
@@ -92,19 +105,20 @@ def amazon_suggest(q: str):
         return []
 
 def google_related_and_paa(q: str):
-    """Best-effort scrape of Related Searches + People Also Ask for more variety."""
+    """Best-effort scrape of Related Searches + People Also Ask (fragile selectors)."""
     out = []
     try:
         r = requests.get("https://www.google.com/search", params={"q": q}, headers=HEADERS, timeout=10)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
-        # Related searches
+        # Related searches — capture anchor text resembling related queries
         for a in soup.select("a"):
             txt = a.get_text(" ", strip=True)
             if txt and len(txt.split()) >= 2 and q.lower() not in txt.lower():
-                if "search?q=" in (a.get("href","") or ""):
+                href = a.get("href", "") or ""
+                if "search?q=" in href:
                     out.append(txt)
-        # PAA (very selector fragile; fallback to any question-like)
+        # PAA-ish — naive capture of question-like text
         for el in soup.find_all(text=True):
             t = str(el).strip()
             if t.endswith("?") and len(t.split()) >= 3:
@@ -130,16 +144,16 @@ def expansions(seed: str, breadth: int = 120):
     # dedupe, cap
     return list(dict.fromkeys(exps))[:breadth]
 
-def fetch_from_sources(query: str, sources: list[str]):
+def fetch_from_sources(query: str, sources: list[str], country: str = "us"):
     acc = []
     if "Google" in sources:
-        acc += google_suggest(query)
+        acc += google_suggest(query, country=country)
         time.sleep(DELAY)
     if "Bing" in sources:
-        acc += bing_suggest(query)
+        acc += bing_suggest(query, country=country)
         time.sleep(DELAY)
     if "YouTube" in sources:
-        acc += youtube_suggest(query)
+        acc += youtube_suggest(query, country=country)
         time.sleep(DELAY)
     if "Amazon" in sources:
         acc += amazon_suggest(query)
@@ -203,6 +217,7 @@ with st.expander("⚙️ Settings & Sources", expanded=True):
         sources = st.multiselect("Sources", ["Google","Bing","YouTube","Amazon"], default=["Google","Bing","YouTube"])
         breadth = st.slider("Expansion breadth per seed", 40, 240, 140, 10)
         min_per_seed = st.slider("Min suggestions per seed (best effort)", 10, 150, 40, 5)
+        country = st.selectbox("Country (influences Google/Bing/YouTube)", ["us","au","in","uk","ca","de","fr","it","es","nl"], index=0)
     with c2:
         min_words = st.slider("Minimum words", 2, 6, 3, 1)
         max_words = st.slider("Maximum words (0 = no max)", 0, 10, 0, 1)
@@ -232,7 +247,7 @@ def expand_seed(seed: str):
     out_rows = []
     got = set()
     for ex in exps:
-        suggs = fetch_from_sources(ex, sources)
+        suggs = fetch_from_sources(ex, sources, country=country)
         for s in suggs:
             s = s.strip()
             if s and s.lower() not in got:
@@ -342,4 +357,4 @@ if run_multi:
     st.download_button("⬇️ Download CSV", data=csv, file_name="keywords_batch.csv", mime="text/csv")
 
 st.markdown("---")
-st.caption("⚠️ Notes: Autocomplete endpoints are unofficial. Use modest rates and consider proxies for larger runs. Some sources (e.g., Amazon) are regionally restricted.")
+st.caption("⚠️ Endpoints are unofficial. Use modest rates and consider proxies for larger runs. Some sources (e.g., Amazon) are regionally restricted.")
