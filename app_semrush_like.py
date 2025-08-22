@@ -1,16 +1,20 @@
 # app_semrush_like.py
-# 🚀 Semrush-like Keyword Explorer (Free) — Streamlit
+# 🚀 Semrush-like Keyword Explorer (Free) — Streamlit (Pro Edition)
 # - Country selector (Google/Bing/YouTube)
-# - Attribute-driven refinement (brands/specs/features/units)
-# - Preset packs + Data sources (Manual / CSV upload / Google Sheet CSV)
+# - Attribute-driven refinement (brands/specs/features/units) + Preset packs
+# - Data sources: Manual / CSV upload / Google Sheet (CSV URL)
 # - Templates to manufacture structured long-tails
 # - Numeric range DSL to auto-generate specs
 # - Synonyms (canonicalization/expansion)
+# - OpenAI Assist: build attribute packs + extract from SERP snippets
+# - SERP harvesting (titles/snippets) & Wikidata enrichment (best-effort)
 # - Multi-source validation (consensus)
+# - Heuristic scoring + optional Google Trends ranking (pytrends, if installed)
 # - Filters, intent, clustering, CSV export
 
+import os, json, re, time
 import streamlit as st
-import requests, time, re
+import requests
 from functools import lru_cache
 from bs4 import BeautifulSoup
 import pandas as pd
@@ -28,7 +32,7 @@ except Exception:
 
 st.set_page_config(page_title="Semrush-like Keyword Explorer (Free)", page_icon="🧠", layout="wide")
 st.title("🧠 Semrush-like Keyword Explorer (Free)")
-st.caption("Start with a single seed to explore widely, then paste many seeds for batch mode.")
+st.caption("Start with a single seed to explore widely. Use attributes, templates, AI Assist, SERP & Wikidata to auto-refine.")
 
 # ---------------------- Config ----------------------
 HEADERS = {
@@ -112,14 +116,12 @@ def google_related_and_paa(q: str):
         r = requests.get("https://www.google.com/search", params={"q": q}, headers=HEADERS, timeout=10)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
-        # Related searches — capture anchor text resembling related queries
         for a in soup.select("a"):
             txt = a.get_text(" ", strip=True)
             if txt and len(txt.split()) >= 2 and q.lower() not in txt.lower():
                 href = a.get("href", "") or ""
                 if "search?q=" in href:
                     out.append(txt)
-        # PAA-ish — naive capture of question-like text
         for el in soup.find_all(text=True):
             t = str(el).strip()
             if t.endswith("?") and len(t.split()) >= 3:
@@ -128,6 +130,68 @@ def google_related_and_paa(q: str):
         pass
     return list(dict.fromkeys(out))
 
+# ---------------------- SERP harvesting (titles/snippets) ----------------------
+def harvest_serp_snippets(query: str, country: str = "us", max_results: int = 10):
+    """Best-effort: scrape Google HTML for titles/snippets (unofficial)."""
+    items = []
+    try:
+        params = {"q": query, "hl": country.lower(), "gl": country.upper()}
+        r = requests.get("https://www.google.com/search", params=params, headers=HEADERS, timeout=10)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        for g in soup.select("div.g"):
+            title_el = g.select_one("h3")
+            if not title_el: 
+                continue
+            title = title_el.get_text(" ", strip=True)
+            snippet_el = g.select_one("span, div[role='text']")
+            snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
+            if title:
+                items.append({"title": title, "snippet": snippet})
+            if len(items) >= max_results:
+                break
+    except Exception:
+        pass
+    return items
+
+# ---------------------- Wikidata enrichment (best-effort) ----------------------
+def wikidata_search_labels(term: str, limit: int = 20):
+    try:
+        r = requests.get(
+            "https://www.wikidata.org/w/api.php",
+            params={
+                "action": "wbsearchentities",
+                "search": term,
+                "language": "en",
+                "format": "json",
+                "limit": limit
+            },
+            timeout=10
+        )
+        r.raise_for_status()
+        data = r.json()
+        return [e.get("label","") for e in data.get("search", []) if e.get("label")]
+    except Exception:
+        return []
+
+def wikidata_enrich_brands(seed: str):
+    """Collect candidate brands via Wikidata search (no strict typing; best-effort)."""
+    queries = [
+        f"{seed} brand",
+        f"{seed} manufacturer",
+        "power tool brand",
+        "garden tool brand",
+        "lawn trimmer brand",
+        "string trimmer brand",
+        "nail gun brand",
+    ]
+    out = set()
+    for q in queries:
+        for lbl in wikidata_search_labels(q, limit=15):
+            out.add(lbl.strip().lower())
+        time.sleep(0.15)
+    return sorted(out)
+
 # ---------------------- Helpers ----------------------
 ALPHANUM = list("abcdefghijklmnopqrstuvwxyz") + [str(i) for i in range(10)]
 COMMON_SUFFIXES = ["for", "with", "without", "best", "cheap", "near me", "vs", "size", "guide", "ideas", "types", "comparison"]
@@ -135,8 +199,8 @@ COMMON_PREFIXES = ["best", "cheap", "top", "how to use", "types of", "difference
 
 def expansions(seed: str, breadth: int = 120):
     exps = [seed]
-    exps += [f"{seed} {c}" for c in ALPHANUM]   # suffix A–Z/0–9
-    exps += [f"{c} {seed}" for c in ALPHANUM]   # prefix A–Z/0–9
+    exps += [f"{seed} {c}" for c in ALPHANUM]
+    exps += [f"{c} {seed}" for c in ALPHANUM]
     exps += [f"{seed} {s}" for s in COMMON_SUFFIXES]
     exps += [f"{p} {seed}" for p in COMMON_PREFIXES]
     return list(dict.fromkeys(exps))[:breadth]
@@ -222,7 +286,7 @@ def has_unit(text: str, units: list[str]) -> bool:
     tl = text.lower()
     return any(re.search(rf"\b{re.escape(u)}\b", tl) for u in units)
 
-# ---------------------- Caching & validation ----------------------
+# ---------------------- Caching, validation & scoring ----------------------
 def fetch_from_sources(query: str, sources: list[str], country: str = "us"):
     acc = []
     if "Google" in sources:
@@ -251,17 +315,126 @@ def cached_suggest_single_source(query: str, source: str, country: str):
         return tuple(amazon_suggest(query))
     return tuple()
 
-def validate_keyword(phrase: str, country: str, require_sources=2, sources=("Google","Bing","YouTube")) -> bool:
-    """Keep only if the exact phrase is confirmed by >= require_sources among the given sources."""
+def validation_hits(phrase: str, country: str, sources=("Google","Bing","YouTube")) -> int:
+    """Count exact matches across sources."""
     hits = 0
     plow = phrase.strip().lower()
     for src in sources:
         suggs = cached_suggest_single_source(phrase, src, country)
         if any(plow == s.strip().lower() for s in suggs):
             hits += 1
-        if hits >= require_sources:
-            return True
-    return False
+    return hits
+
+def compute_strength_cols(df: pd.DataFrame, brands, specs, features, units):
+    df["SourcesMatched"] = df["Keyword"].apply(lambda s: validation_hits(s, country))
+    df["AttrHits"] = df["Keyword"].apply(lambda s: count_attribute_hits(s, brands) + count_attribute_hits(s, specs) + count_attribute_hits(s, features))
+    df["HasNumber"] = df["Keyword"].apply(has_number)
+    df["HasUnit"] = df["Keyword"].apply(lambda s: has_unit(s, units))
+    df["WordCount"] = df["Keyword"].str.split().map(len)
+    # Heuristic score
+    df["Score"] = (
+        2.0 * df["SourcesMatched"] +
+        1.5 * df["AttrHits"] +
+        0.5 * (df["WordCount"] - 2).clip(lower=0) +
+        df["HasNumber"].map(lambda x: 1.0 if x else 0.0) +
+        df["HasUnit"].map(lambda x: 0.7 if x else 0.0)
+    )
+    return df
+
+# ---------------------- Google Trends (optional) ----------------------
+COUNTRY_TO_TRENDS = {"us":"US","au":"AU","in":"IN","uk":"GB","ca":"CA","de":"DE","fr":"FR","it":"IT","es":"ES","nl":"NL"}
+
+def try_trends_scores(keywords, country_code="US"):
+    try:
+        from pytrends.request import TrendReq
+        pytrends = TrendReq(hl="en-US", tz=360)
+        out = {}
+        # Batch in groups of 5 (pytrends limit)
+        ks = [k for k in keywords][:50]
+        for i in range(0, len(ks), 5):
+            chunk = ks[i:i+5]
+            pytrends.build_payload(chunk, timeframe="today 12-m", geo=country_code)
+            df = pytrends.interest_over_time()
+            if df is None or df.empty: 
+                continue
+            for k in chunk:
+                if k in df.columns:
+                    out[k] = float(df[k].mean())
+            time.sleep(0.3)
+        return out
+    except Exception:
+        return {}
+
+# ---------------------- OpenAI utilities ----------------------
+def ai_build_attribute_pack(seed: str, country: str, style: str, api_key: str) -> dict:
+    """Return dict: brands, specs, features, units, synonyms, templates."""
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+        system = (
+            "You generate attribute packs for programmatic SEO keyword expansion. "
+            "Return STRICT JSON with keys: brands (list), specs (list), features (list), "
+            "units (list), synonyms (list of strings), templates (list of strings). "
+            "Specs should include numeric+unit forms (e.g., 16 gauge, 36v, 5 inch). "
+            "Templates must use placeholders {seed}, {brand}, {spec}, {feature}. "
+            "No text outside JSON."
+        )
+        user = f"""
+        Seed: {seed}
+        Country/locale: {country}
+        Vertical style: {style}
+
+        Constraints:
+        - 20–50 brands relevant to the seed (if applicable)
+        - 20–80 specs (include numeric series like volt ranges, gauge sizes, inches/mm)
+        - 15–40 features (materials, power types, form factor, attachments)
+        - 6–12 units (v, volt, volts, gauge, mm, inch, cc, stroke, ah)
+        - 5–12 synonyms (e.g., whipper snipper | line trimmer | string trimmer)
+        - 6–12 templates:
+          {{brand}} {{spec}} {{seed}}
+          {{spec}} {{seed}} for {{feature}}
+          {{brand}} {{seed}} {{feature}}
+          {{spec}} {{seed}}
+        """
+        resp = client.responses.create(
+            model="gpt-4o-mini",
+            input=[{"role":"system","content":system},{"role":"user","content":user}],
+            response_format={"type":"json_object"},
+        )
+        text = resp.output_text
+        data = json.loads(text)
+        for k in ["brands","specs","features","units","synonyms","templates"]:
+            data.setdefault(k, [])
+            data[k] = [str(x).strip() for x in data[k] if str(x).strip()]
+        return data
+    except Exception:
+        return {}
+
+def ai_extract_attributes_from_snippets(snippets: list, country: str, style: str, api_key: str) -> dict:
+    """Given SERP titles/snippets, extract brands/specs/features/units/synonyms/templates JSON."""
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+        system = (
+            "Extract structured attributes for programmatic SEO from SERP snippets. "
+            "Return STRICT JSON: {brands:[], specs:[], features:[], units:[], synonyms:[], templates:[]} "
+            "Infer common numeric specs (e.g., 12v, 18v, 36v; 16 gauge, 18 gauge; inches/mm). "
+            "Templates must use {seed}, {brand}, {spec}, {feature}. No extra text."
+        )
+        text_blob = "\n\n".join([f"Title: {s.get('title','')}\nSnippet: {s.get('snippet','')}" for s in snippets])
+        user = f"Country: {country}\nVertical: {style}\nSERP:\n{text_blob}"
+        resp = client.responses.create(
+            model="gpt-4o-mini",
+            input=[{"role":"system","content":system},{"role":"user","content":user}],
+            response_format={"type":"json_object"},
+        )
+        data = json.loads(resp.output_text)
+        for k in ["brands","specs","features","units","synonyms","templates"]:
+            data.setdefault(k, [])
+            data[k] = [str(x).strip().lower() for x in data[k] if str(x).strip()]
+        return data
+    except Exception:
+        return {}
 
 # ---------------------- UI: Settings & Sources ----------------------
 with st.expander("⚙️ Settings & Sources", expanded=True):
@@ -275,6 +448,7 @@ with st.expander("⚙️ Settings & Sources", expanded=True):
         min_words = st.slider("Minimum words", 2, 6, 3, 1)
         max_words = st.slider("Maximum words (0 = no max)", 0, 10, 0, 1)
         long_tail_only = st.checkbox("Only long-tail (≥3 words)", True)
+        validation_min_sources = st.slider("Require exact match from N sources", 1, 3, 2, 1)
     with c3:
         include_terms = st.text_input("Must include terms (comma/line)", "")
         exclude_terms = st.text_area("Exclude terms (comma/line)", "bunnings\ntotal tools\nsydneytools\namazon\nebay")
@@ -285,19 +459,18 @@ with st.expander("⚙️ Settings & Sources", expanded=True):
         cluster_target = st.slider("Target clusters", 2, 50, 12, 1)
         fetch_paa = st.checkbox("Enrich with Google Related & PAA (experimental)", False)
 
-# ---------------------- UI: Data sources (attributes at scale) ----------------------
+# ---------------------- UI: Data sources for attributes ----------------------
 with st.expander("📚 Data sources (attributes at scale)", expanded=False):
     mode = st.radio("Load attributes from", ["Manual lists", "Upload CSV", "Google Sheet (CSV URL)"], horizontal=True)
     uploaded_attrs = None
     sheet_url = ""
     if mode == "Upload CSV":
-        uploaded_attrs = st.file_uploader("Upload CSV with columns: type,value   (type in: brand, spec, feature, unit)", type=["csv"])
+        uploaded_attrs = st.file_uploader("Upload CSV with columns: type,value   (type ∈ brand|spec|feature|unit)", type=["csv"])
     elif mode == "Google Sheet (CSV URL)":
         sheet_url = st.text_input("Paste CSV export URL of your Google Sheet")
 
 def load_attributes_from_csv(file_or_url):
     df = pd.read_csv(file_or_url)
-    # Expect columns: type,value. type in {"brand","spec","feature","unit"}
     out = {"brand": set(), "spec": set(), "feature": set(), "unit": set()}
     if "type" in df.columns and "value" in df.columns:
         for _, row in df.iterrows():
@@ -310,15 +483,8 @@ def load_attributes_from_csv(file_or_url):
 # ---------------------- UI: Attribute-driven refinement panel ----------------------
 with st.expander("🎯 Attribute-driven refinement (brands/specs/features)", expanded=True):
     colA, colB, colC, colD = st.columns(4)
-
-    # Presets
     PRESETS = {
-        "None": {
-            "brands": "",
-            "specs": "",
-            "features": "",
-            "units": "v, volt, volts, gauge, mm, inch"
-        },
+        "None": {"brands":"", "specs":"", "features":"", "units":"v, volt, volts, gauge, mm, inch"},
         "Power Tools": {
             "brands": "makita\nhusqvarna\nmilwaukee\ndewalt\ngreenworks\nbosch\nryobi\nhitachi\nhilti",
             "specs": "12v\n18v\n24v\n36v\n40v\n54v\n16 gauge\n18 gauge\n23 gauge",
@@ -332,14 +498,11 @@ with st.expander("🎯 Attribute-driven refinement (brands/specs/features)", exp
             "units": "v, volt, volts, cc, stroke, inch, mm"
         }
     }
-
     with colA:
         use_attr_mode = st.checkbox("Use attribute combinator", True)
         min_attrs_required = st.slider("Require at least N attributes", 1, 3, 1, 1)
         preset_choice = st.selectbox("Preset pack", list(PRESETS.keys()), index=1)
         apply_preset = st.button("Apply preset")
-
-    # Initialize session_state for text areas
     if "brands_text" not in st.session_state:
         st.session_state["brands_text"] = PRESETS["Power Tools"]["brands"]
     if "specs_text" not in st.session_state:
@@ -348,32 +511,27 @@ with st.expander("🎯 Attribute-driven refinement (brands/specs/features)", exp
         st.session_state["features_text"] = PRESETS["Power Tools"]["features"]
     if "units_text" not in st.session_state:
         st.session_state["units_text"] = PRESETS["Power Tools"]["units"]
-
     if apply_preset:
         st.session_state["brands_text"] = PRESETS[preset_choice]["brands"]
         st.session_state["specs_text"] = PRESETS[preset_choice]["specs"]
         st.session_state["features_text"] = PRESETS[preset_choice]["features"]
         st.session_state["units_text"] = PRESETS[preset_choice]["units"]
-
     with colB:
         require_number = st.checkbox("Require a number (e.g., 16, 36, 40)", True)
         require_unit = st.checkbox("Require a unit/spec (e.g., v, gauge, mm)", True)
-
     with colC:
         brands_text = st.text_area("Brands (one per line)", st.session_state["brands_text"], height=160, key="brands_text")
         specs_text = st.text_area("Specs (one per line)", st.session_state["specs_text"], height=160, key="specs_text")
-
     with colD:
         features_text = st.text_area("Features (one per line)", st.session_state["features_text"], height=160, key="features_text")
         units_text = st.text_input("Units (comma-separated)", st.session_state["units_text"], key="units_text")
 
 # ---------------------- UI: Templates (power users) ----------------------
+default_tpl = st.session_state.get("templates_text", "{brand} {spec} {seed}\n{spec} {seed}\n{brand} {seed} {feature}")
 with st.expander("🧩 Templates (power user)", expanded=False):
     templates_text = st.text_area(
-        "One template per line. Use {seed}, {brand}, {spec}, {feature}.\n"
-        "Examples:\n"
-        "{brand} {spec} {seed}\n{spec} {seed} for {feature}\n{brand} {seed}\n{spec} {seed}",
-        "{brand} {spec} {seed}\n{spec} {seed}\n{brand} {seed} {feature}",
+        "One template per line. Use {seed}, {brand}, {spec}, {feature}.",
+        default_tpl,
         height=140
     )
 
@@ -386,11 +544,9 @@ def render_templates(templates, seed, brands, specs, features, limit_per_templat
         has_brand   = "{brand}"   in tpl
         has_spec    = "{spec}"    in tpl
         has_feature = "{feature}" in tpl
-
         b_iter = brands   if has_brand   else [None]
         s_iter = specs    if has_spec    else [None]
         f_iter = features if has_feature else [None]
-
         count = 0
         for b in b_iter:
             for s in s_iter:
@@ -424,14 +580,12 @@ def parse_generators(gen_text):
         line = line.strip()
         if not line:
             continue
-        # pattern: name=START-END step N suffix "txt"
         m = re.match(r".*?=(\d+)\s*-\s*(\d+)\s*step\s*(\d+)\s*suffix\s*\"([^\"]+)\"", line, flags=re.I)
         if m:
             start, end, step, suf = int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4)
             for n in range(start, end+1, step):
                 specs.append(f"{n}{suf}")
         else:
-            # Comma list with suffix: name=15,16,18 suffix " gauge"
             m2 = re.match(r".*?=([\d,\s]+)\s*suffix\s*\"([^\"]+)\"", line, flags=re.I)
             if m2:
                 nums = [x.strip() for x in m2.group(1).split(",") if x.strip()]
@@ -463,7 +617,101 @@ def expand_with_synonyms(seed, synmap):
             out |= set([canon] + alts)
     return sorted(out)
 
-# ---------------------- Seed expansion core ----------------------
+# ---------------------- 🤖 OpenAI Assist ----------------------
+with st.expander("🤖 AI Assist (OpenAI) — auto-build attribute packs", expanded=False):
+    st.caption("Generate brands/specs/features/units/synonyms/templates from a seed or from SERP snippets.")
+    ai_enabled = st.toggle("Enable OpenAI assist", value=False)
+    openai_key = os.getenv("OPENAI_API_KEY") or st.text_input("OpenAI API Key (overrides env)", type="password")
+    ai_seed = st.text_input("Seed for AI pack (defaults to your Single Seed)", placeholder="e.g. whipper snipper")
+    ai_country = st.selectbox("AI country context", ["us","au","in","uk","ca","de","fr","it","es","nl"], index=0, key="ai_country")
+    ai_style = st.selectbox("Pack style", ["Power Tools / Garden", "Generic retail"], index=0)
+    run_ai = st.button("💡 Generate pack")
+    ai_json = st.empty()
+    use_pack_btn = st.empty()
+    # SERP + LLM extraction
+    st.markdown("---")
+    st.caption("SERP enrichment (harvest Google titles/snippets, then extract attributes with AI)")
+    do_serp = st.checkbox("Harvest SERP & Extract with OpenAI", value=False)
+    serp_queries_text = st.text_area("SERP queries (one per line)", "whipper snipper brands\nwhipper snipper specs\nbest whipper snipper brands", height=100)
+    serp_run = st.button("🔎 Run SERP + AI Extract")
+    serp_json = st.empty()
+    use_serp_btn = st.empty()
+    # Wikidata enrichment
+    st.markdown("---")
+    st.caption("Wikidata enrichment (best-effort brand discovery)")
+    use_wikidata = st.checkbox("Enrich brands via Wikidata", value=False)
+    wikidata_preview = st.empty()
+    wikidata_btn = st.button("🌐 Fetch Wikidata brands")
+
+if ai_enabled and run_ai:
+    if not (openai_key or os.getenv("OPENAI_API_KEY")):
+        st.warning("Please provide an OpenAI API key.")
+    else:
+        with st.spinner("Calling OpenAI to build an attribute pack…"):
+            base_seed = ai_seed.strip() or "whipper snipper"
+            data = ai_build_attribute_pack(base_seed, ai_country, ai_style, openai_key or os.getenv("OPENAI_API_KEY"))
+        if not data:
+            st.error("No data returned. Try again or switch style.")
+        else:
+            ai_json.json(data)
+            if use_pack_btn.button("✅ Use this pack"):
+                st.session_state["brands_text"]   = "\n".join(data.get("brands", [])) or st.session_state.get("brands_text","")
+                st.session_state["specs_text"]    = "\n".join(data.get("specs", [])) or st.session_state.get("specs_text","")
+                st.session_state["features_text"] = "\n".join(data.get("features", [])) or st.session_state.get("features_text","")
+                st.session_state["units_text"]    = ", ".join(data.get("units", [])) or st.session_state.get("units_text","")
+                st.session_state["templates_text"] = "\n".join(data.get("templates", []))
+                st.success("Pack applied to current session.")
+
+if ai_enabled and do_serp and serp_run:
+    if not (openai_key or os.getenv("OPENAI_API_KEY")):
+        st.warning("Please provide an OpenAI API key.")
+    else:
+        with st.spinner("Harvesting SERP & extracting attributes with OpenAI…"):
+            all_snips = []
+            for q in [q.strip() for q in serp_queries_text.splitlines() if q.strip()]:
+                all_snips += harvest_serp_snippets(q, country=ai_country, max_results=10)
+                time.sleep(0.2)
+            data = ai_extract_attributes_from_snippets(all_snips, ai_country, ai_style, openai_key or os.getenv("OPENAI_API_KEY"))
+        if not data:
+            st.error("No data extracted.")
+        else:
+            serp_json.json(data)
+            if use_serp_btn.button("✅ Merge SERP pack into lists"):
+                # merge (dedupe) into current session lists
+                st.session_state["brands_text"]   = "\n".join(sorted(set(_to_list(st.session_state.get("brands_text","")))   | set(data.get("brands",[]))))
+                st.session_state["specs_text"]    = "\n".join(sorted(set(_to_list(st.session_state.get("specs_text","")))    | set(data.get("specs",[]))))
+                st.session_state["features_text"] = "\n".join(sorted(set(_to_list(st.session_state.get("features_text",""))) | set(data.get("features",[]))))
+                units_cur = _to_list(st.session_state.get("units_text",""))
+                st.session_state["units_text"]    = ", ".join(sorted(set(units_cur) | set(data.get("units",[]))))
+                if data.get("templates"):
+                    st.session_state["templates_text"] = "\n".join(sorted(set(_to_list(st.session_state.get("templates_text","").replace("\n",","))) | set(data.get("templates",[]))))
+                st.success("Merged SERP-derived attributes into current lists.")
+
+if use_wikidata and wikidata_btn:
+    with st.spinner("Querying Wikidata for brand candidates…"):
+        wd = wikidata_enrich_brands("whipper snipper")
+    wikidata_preview.write(", ".join(wd) if wd else "No results.")
+    if wd:
+        st.session_state["brands_text"] = "\n".join(sorted(set(_to_list(st.session_state.get("brands_text",""))) | set(wd)))
+        st.success("Merged Wikidata brands into current list.")
+
+# ---------------------- Seeds & run ----------------------
+st.subheader("Seed Keywords")
+tab1, tab2 = st.tabs(["Single seed (Semrush-style explore)","Multiple seeds (batch)"])
+with tab1:
+    seed_single = st.text_input("Enter a single seed keyword", placeholder="e.g. whipper snipper")
+with tab2:
+    seeds_multi = st.text_area("Enter multiple seeds (one per line)", height=160, placeholder="e.g.\nwhipper snipper\nnail gun\nimpact driver")
+
+# Ranking options
+with st.expander("📊 Ranking options", expanded=False):
+    use_trends = st.checkbox("Use Google Trends to boost ranking (pytrends, optional)", value=False)
+    rank_mode = st.selectbox("Rank by", ["Heuristic only", "Heuristic + Trends (if available)"], index=1)
+
+run_single = st.button("🔍 Explore Single Seed")
+run_multi = st.button("🚀 Run Batch")
+
+# ---------------------- Core expansion ----------------------
 def expand_seed(seed: str):
     out_rows = []
     got = set()
@@ -513,24 +761,12 @@ def expand_seed(seed: str):
                     sl = s.lower().strip()
                     if not sl or sl in got: 
                         continue
-
-                    # Attribute gating
-                    hits = 0
-                    hits += count_attribute_hits(sl, brands)
-                    hits += count_attribute_hits(sl, specs)
-                    hits += count_attribute_hits(sl, features)
-
-                    if hits < min_attrs_required:
-                        continue
-                    if require_number and not has_number(sl):
-                        continue
-                    if require_unit and units and not has_unit(sl, units):
-                        continue
-
-                    # Multi-source validation (optional; stricter)
-                    if not validate_keyword(s, country, require_sources=2):
-                        continue
-
+                    hits = count_attribute_hits(sl, brands) + count_attribute_hits(sl, specs) + count_attribute_hits(sl, features)
+                    if hits < min_attrs_required: continue
+                    if require_number and not has_number(sl): continue
+                    if require_unit and units and not has_unit(sl, units): continue
+                    # multi-source validation
+                    if validation_hits(s, country) < validation_min_sources: continue
                     got.add(sl)
                     out_rows.append({"Keyword": s.strip(), "Seed": seed, "SourceQuery": cand})
                 if len(out_rows) >= min_per_seed:
@@ -538,7 +774,7 @@ def expand_seed(seed: str):
             if len(out_rows) >= min_per_seed:
                 break
 
-    # 2) Attribute combinator (brand/spec/feature mixing) if templates didn't fill enough
+    # 2) Attribute combinator if still short
     if use_attr_mode and len(out_rows) < min_per_seed:
         for seed_variant in seed_variants:
             attr_candidates = generate_attribute_candidates(seed_variant, brands, specs, features)
@@ -546,22 +782,13 @@ def expand_seed(seed: str):
                 suggs = fetch_from_sources(cand, sources, country=country)
                 for s in suggs:
                     sl = s.lower().strip()
-                    if not sl or sl in got:
+                    if not sl or sl in got: 
                         continue
-
-                    hits = 0
-                    hits += count_attribute_hits(sl, brands)
-                    hits += count_attribute_hits(sl, specs)
-                    hits += count_attribute_hits(sl, features)
-                    if hits < min_attrs_required:
-                        continue
-                    if require_number and not has_number(sl):
-                        continue
-                    if require_unit and units and not has_unit(sl, units):
-                        continue
-                    if not validate_keyword(s, country, require_sources=2):
-                        continue
-
+                    hits = count_attribute_hits(sl, brands) + count_attribute_hits(sl, specs) + count_attribute_hits(sl, features)
+                    if hits < min_attrs_required: continue
+                    if require_number and not has_number(sl): continue
+                    if require_unit and units and not has_unit(sl, units): continue
+                    if validation_hits(s, country) < validation_min_sources: continue
                     got.add(sl)
                     out_rows.append({"Keyword": s.strip(), "Seed": seed, "SourceQuery": cand})
                 if len(out_rows) >= min_per_seed:
@@ -576,7 +803,7 @@ def expand_seed(seed: str):
             suggs = fetch_from_sources(ex, sources, country=country)
             for s in suggs:
                 sl = s.lower().strip()
-                if not sl or sl in got:
+                if not sl or sl in got: 
                     continue
                 got.add(sl)
                 out_rows.append({"Keyword": s.strip(), "Seed": seed, "SourceQuery": ex})
@@ -603,17 +830,7 @@ def parse_list(s: str):
     parts = re.split(r"[,\n]+", s.strip())
     return [p.strip().lower() for p in parts if p.strip()]
 
-# ---------------------- Seeds & run ----------------------
-st.subheader("Seed Keywords")
-tab1, tab2 = st.tabs(["Single seed (Semrush-style explore)","Multiple seeds (batch)"])
-with tab1:
-    seed_single = st.text_input("Enter a single seed keyword", placeholder="e.g. whipper snipper")
-with tab2:
-    seeds_multi = st.text_area("Enter multiple seeds (one per line)", height=160, placeholder="e.g.\nwhipper snipper\nnail gun\nimpact driver")
-
-run_single = st.button("🔍 Explore Single Seed")
-run_multi = st.button("🚀 Run Batch")
-
+# ---------------------- Run: Single ----------------------
 if run_single:
     if not seed_single.strip():
         st.warning("Please enter a seed keyword.")
@@ -629,7 +846,6 @@ if run_single:
     inc = parse_list(include_terms)
     exc = parse_list(exclude_terms)
     df = apply_filters(df, min_words, max_words if max_words>0 else None, inc, exc, regex_inc, regex_exc, long_tail_only)
-
     if df.empty:
         st.warning("All suggestions were filtered out. Relax filters.")
         st.stop()
@@ -640,12 +856,39 @@ if run_single:
                                  n_clusters=cluster_target,
                                  method="auto" if clustering_method.startswith("auto") else clustering_method)
     df["Cluster"] = [f"Cluster {int(l)+1}" for l in labels]
-    df = df.sort_values(["Cluster","Intent","Keyword"]).reset_index(drop=True)
+
+    # Scoring
+    brands = _to_list(st.session_state["brands_text"])
+    specs = _to_list(st.session_state["specs_text"])
+    features = _to_list(st.session_state["features_text"])
+    units = _to_list(st.session_state["units_text"])
+    df = compute_strength_cols(df, brands, specs, features, units)
+
+    # Optional Trends
+    if use_trends:
+        geo = COUNTRY_TO_TRENDS.get(country, "US")
+        with st.spinner("Fetching Google Trends scores (best-effort)…"):
+            trends = try_trends_scores(df["Keyword"].tolist(), country_code=geo)
+        if trends:
+            df["TrendScore"] = df["Keyword"].map(lambda k: trends.get(k, 0.0))
+            if rank_mode.startswith("Heuristic +"):
+                df["RankScore"] = df["Score"] + 0.8 * df["TrendScore"]
+            else:
+                df["RankScore"] = df["Score"]
+        else:
+            df["TrendScore"] = 0.0
+            df["RankScore"] = df["Score"]
+    else:
+        df["TrendScore"] = 0.0
+        df["RankScore"] = df["Score"]
+
+    # Sort & display
+    df = df.sort_values(["RankScore","Cluster","Intent","Keyword"], ascending=[False, True, True, True]).reset_index(drop=True)
 
     st.success(f"Collected {len(df)} suggestions across {k} clusters.")
     st.dataframe(df, use_container_width=True, height=520)
 
-    # quick facets
+    # quick facets/report
     c1, c2, c3 = st.columns(3)
     with c1:
         st.write("**Intent counts**")
@@ -657,9 +900,21 @@ if run_single:
         st.write("**Avg words per keyword**")
         st.write(round(df["Keyword"].str.split().map(len).mean(),2))
 
+    # Simple brand/spec/feature coverage report
+    with st.expander("📈 Coverage report (brands/specs/features)", expanded=False):
+        def top_hits(keys, name):
+            counts = {t: df["Keyword"].str.lower().str.contains(re.escape(t)).sum() for t in keys}
+            top = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:20]
+            st.write(f"**Top {name} by presence**")
+            st.write(pd.DataFrame(top, columns=[name, "count"]))
+        top_hits(brands, "brands")
+        top_hits(specs, "specs")
+        top_hits(features, "features")
+
     csv = df.to_csv(index=False).encode("utf-8")
     st.download_button("⬇️ Download CSV", data=csv, file_name=f"keywords_{seed_single.replace(' ','_')}.csv", mime="text/csv")
 
+# ---------------------- Run: Batch ----------------------
 if run_multi:
     seeds = [s.strip() for s in seeds_multi.splitlines() if s.strip()]
     if not seeds:
@@ -680,7 +935,6 @@ if run_multi:
     inc = parse_list(include_terms)
     exc = parse_list(exclude_terms)
     df = apply_filters(df, min_words, max_words if max_words>0 else None, inc, exc, regex_inc, regex_exc, long_tail_only)
-
     if df.empty:
         st.warning("All suggestions were filtered out. Relax filters.")
         st.stop()
@@ -691,7 +945,34 @@ if run_multi:
                                  n_clusters=cluster_target,
                                  method="auto" if clustering_method.startswith("auto") else clustering_method)
     df["Cluster"] = [f"Cluster {int(l)+1}" for l in labels]
-    df = df.sort_values(["Seed","Cluster","Intent","Keyword"]).reset_index(drop=True)
+
+    # Scoring
+    brands = _to_list(st.session_state["brands_text"])
+    specs = _to_list(st.session_state["specs_text"])
+    features = _to_list(st.session_state["features_text"])
+    units = _to_list(st.session_state["units_text"])
+    df = compute_strength_cols(df, brands, specs, features, units)
+
+    # Optional Trends
+    if use_trends:
+        geo = COUNTRY_TO_TRENDS.get(country, "US")
+        with st.spinner("Fetching Google Trends scores (best-effort)…"):
+            trends = try_trends_scores(df["Keyword"].tolist(), country_code=geo)
+        if trends:
+            df["TrendScore"] = df["Keyword"].map(lambda k: trends.get(k, 0.0))
+            if rank_mode.startswith("Heuristic +"):
+                df["RankScore"] = df["Score"] + 0.8 * df["TrendScore"]
+            else:
+                df["RankScore"] = df["Score"]
+        else:
+            df["TrendScore"] = 0.0
+            df["RankScore"] = df["Score"]
+    else:
+        df["TrendScore"] = 0.0
+        df["RankScore"] = df["Score"]
+
+    # Sort & display
+    df = df.sort_values(["Seed","RankScore","Cluster","Intent","Keyword"], ascending=[True, False, True, True, True]).reset_index(drop=True)
 
     st.success(f"Collected {len(df)} total suggestions across {k} clusters.")
     st.dataframe(df, use_container_width=True, height=520)
@@ -700,4 +981,4 @@ if run_multi:
     st.download_button("⬇️ Download CSV", data=csv, file_name="keywords_batch.csv", mime="text/csv")
 
 st.markdown("---")
-st.caption("⚠️ Endpoints are unofficial. Use modest rates and consider proxies for larger runs. For large CSV/Sheet lists, start with smaller breadth and loosen filters gradually.")
+st.caption("⚠️ Endpoints are unofficial. Use modest rates and consider proxies for larger runs. For Trends, add `pytrends` to requirements. For AI Assist, set OPENAI_API_KEY.")
