@@ -1,11 +1,12 @@
 # app_semrush_like.py
 # 🚀 Semrush-like Keyword Explorer (Free) — Streamlit
 # - Country selector for region-specific suggestions (Google/Bing/YouTube)
-# - Enter one or many seeds
+# - Attribute-driven refinement (brands/specs/features/units)
+# - Preset packs (Power Tools, Garden Tools)
 # - Multi-source autocomplete (Google, Bing, YouTube, Amazon*)
 # - A–Z / 0–9 expansion, prefix/suffix expansion
 # - Optional PAA + Related Searches (best-effort)
-# - Long-tail filters, include/exclude lists, regex filters
+# - Long-tail filters, include/exclude, regex filters
 # - Intent labeling + clustering
 # - CSV export
 
@@ -210,6 +211,46 @@ def apply_filters(df: pd.DataFrame, min_words: int, max_words: int|None, include
         return True
     return df[df["Keyword"].apply(ok)].copy()
 
+def _to_list(txt: str):
+    return [t.strip().lower() for t in re.split(r"[,\n]+", txt) if t.strip()]
+
+def generate_attribute_candidates(seed: str, brands: list[str], specs: list[str], features: list[str]) -> list[str]:
+    seed = seed.strip()
+    cands = set()
+
+    # Brand + Spec + Seed  (e.g., "makita 36v whipper snipper")
+    for b in brands:
+        for s in specs:
+            cands.add(f"{b} {s} {seed}")
+            cands.add(f"{s} {b} {seed}")
+
+    # Brand + Seed (+ Feature)
+    for b in brands:
+        cands.add(f"{b} {seed}")
+        for f in features:
+            cands.add(f"{b} {seed} {f}")
+            cands.add(f"{b} {f} {seed}")
+
+    # Spec + Seed and Feature + Seed
+    for s in specs:
+        cands.add(f"{s} {seed}")
+    for f in features:
+        cands.add(f"{f} {seed}")
+        cands.add(f"{seed} {f}")
+
+    return list(cands)
+
+def count_attribute_hits(text: str, tokens: list[str]) -> int:
+    tl = text.lower()
+    return sum(1 for t in tokens if t in tl)
+
+def has_number(text: str) -> bool:
+    return bool(re.search(r"\b\d+\b", text))
+
+def has_unit(text: str, units: list[str]) -> bool:
+    tl = text.lower()
+    return any(re.search(rf"\b{re.escape(u)}\b", tl) for u in units)
+
 # ---------------------- UI ----------------------
 with st.expander("⚙️ Settings & Sources", expanded=True):
     c1, c2, c3, c4 = st.columns(4)
@@ -232,37 +273,131 @@ with st.expander("⚙️ Settings & Sources", expanded=True):
         cluster_target = st.slider("Target clusters", 2, 50, 12, 1)
         fetch_paa = st.checkbox("Enrich with Google Related & PAA (experimental)", False)
 
-st.subheader("Seed Keywords")
-tab1, tab2 = st.tabs(["Single seed (Semrush-style explore)","Multiple seeds (batch)"])
-with tab1:
-    seed_single = st.text_input("Enter a single seed keyword", placeholder="e.g. line trimmer")
-with tab2:
-    seeds_multi = st.text_area("Enter multiple seeds (one per line)", height=160, placeholder="e.g.\nline trimmer\ndrill\nimpact driver")
+# ---------------------- Attribute-driven refinement panel ----------------------
+with st.expander("🎯 Attribute-driven refinement (brands/specs/features)", expanded=True):
+    colA, colB, colC, colD = st.columns(4)
 
-run_single = st.button("🔍 Explore Single Seed")
-run_multi = st.button("🚀 Run Batch")
+    # Presets
+    PRESETS = {
+        "None": {
+            "brands": "",
+            "specs": "",
+            "features": "",
+            "units": "v, volt, volts, gauge, mm, inch"
+        },
+        "Power Tools": {
+            "brands": "makita\nhusqvarna\nmilwaukee\ndewalt\ngreenworks\nbosch\nryobi\nhitachi\nhilti",
+            "specs": "12v\n18v\n24v\n36v\n40v\n54v\n16 gauge\n18 gauge\n23 gauge",
+            "features": "cordless\ncorded\nair\npneumatic\nbrushless\ncompact\nframing\nfinish\nbrad",
+            "units": "v, volt, volts, gauge, mm, inch, ah"
+        },
+        "Garden Tools": {
+            "brands": "husqvarna\nmakita\ndevalt\nstihl\nego\ngreenworks\nryobi",
+            "specs": "18v\n36v\n40v\n58v\n2 stroke\n4 stroke\n25cc\n30cc\n40cc",
+            "features": "cordless\nbattery operated\nmetal blade\nline\nstring\nwith wheels\nstraight shaft",
+            "units": "v, volt, volts, cc, stroke, inch, mm"
+        }
+    }
+
+    with colA:
+        use_attr_mode = st.checkbox("Use attribute combinator", True)
+        min_attrs_required = st.slider("Require at least N attributes", 1, 3, 1, 1)
+        preset_choice = st.selectbox("Preset pack", list(PRESETS.keys()), index=1)
+        apply_preset = st.button("Apply preset")
+
+    # Initialize session_state for text areas
+    if "brands_text" not in st.session_state:
+        st.session_state["brands_text"] = PRESETS["Power Tools"]["brands"]
+    if "specs_text" not in st.session_state:
+        st.session_state["specs_text"] = PRESETS["Power Tools"]["specs"]
+    if "features_text" not in st.session_state:
+        st.session_state["features_text"] = PRESETS["Power Tools"]["features"]
+    if "units_text" not in st.session_state:
+        st.session_state["units_text"] = PRESETS["Power Tools"]["units"]
+
+    if apply_preset:
+        st.session_state["brands_text"] = PRESETS[preset_choice]["brands"]
+        st.session_state["specs_text"] = PRESETS[preset_choice]["specs"]
+        st.session_state["features_text"] = PRESETS[preset_choice]["features"]
+        st.session_state["units_text"] = PRESETS[preset_choice]["units"]
+
+    with colB:
+        require_number = st.checkbox("Require a number (e.g., 16, 36, 40)", True)
+        require_unit = st.checkbox("Require a unit/spec (e.g., v, gauge, mm)", True)
+
+    with colC:
+        brands_text = st.text_area("Brands (one per line)", st.session_state["brands_text"], height=160, key="brands_text")
+        specs_text = st.text_area("Specs (one per line)", st.session_state["specs_text"], height=160, key="specs_text")
+
+    with colD:
+        features_text = st.text_area("Features (one per line)", st.session_state["features_text"], height=160, key="features_text")
+        units_text = st.text_input("Units (comma-separated)", st.session_state["units_text"], key="units_text")
 
 def expand_seed(seed: str):
-    exps = expansions(seed, breadth=breadth)
     out_rows = []
     got = set()
-    for ex in exps:
-        suggs = fetch_from_sources(ex, sources, country=country)
-        for s in suggs:
-            s = s.strip()
-            if s and s.lower() not in got:
-                got.add(s.lower())
-                out_rows.append({"Keyword": s, "Seed": seed, "SourceQuery": ex})
-        if len(out_rows) >= min_per_seed:
-            break
-    # Optional enrichment
-    if fetch_paa:
+
+    # Parse attribute lists from UI
+    brands = _to_list(st.session_state["brands_text"])
+    specs = _to_list(st.session_state["specs_text"])
+    features = _to_list(st.session_state["features_text"])
+    units = _to_list(st.session_state["units_text"])
+
+    # 1) Attribute-driven candidate generation + validation
+    if use_attr_mode:
+        attr_candidates = generate_attribute_candidates(seed, brands, specs, features)
+        for cand in attr_candidates:
+            suggs = fetch_from_sources(cand, sources, country=country)
+            for s in suggs:
+                sl = s.lower().strip()
+                if not sl or sl in got:
+                    continue
+
+                # Enforce attribute richness
+                hits = 0
+                hits += count_attribute_hits(sl, brands)
+                hits += count_attribute_hits(sl, specs)
+                hits += count_attribute_hits(sl, features)
+
+                if hits < min_attrs_required:
+                    continue
+                if require_number and not has_number(sl):
+                    continue
+                if require_unit and units and not has_unit(sl, units):
+                    continue
+
+                got.add(sl)
+                out_rows.append({"Keyword": s.strip(), "Seed": seed, "SourceQuery": cand})
+
+            if len(out_rows) >= min_per_seed:
+                break
+
+    # 2) Fallback to broad expansions if we still need more
+    if len(out_rows) < min_per_seed:
+        exps = expansions(seed, breadth=breadth)
+        for ex in exps:
+            suggs = fetch_from_sources(ex, sources, country=country)
+            for s in suggs:
+                sl = s.lower().strip()
+                if not sl or sl in got:
+                    continue
+                got.add(sl)
+                out_rows.append({"Keyword": s.strip(), "Seed": seed, "SourceQuery": ex})
+            if len(out_rows) >= min_per_seed:
+                break
+
+    # 3) Optional PAA/Related enrichment
+    if fetch_paa and len(out_rows) < min_per_seed:
         more = google_related_and_paa(seed)
         for s in more:
-            s = s.strip()
-            if s and s.lower() not in got:
-                got.add(s.lower())
-                out_rows.append({"Keyword": s, "Seed": seed, "SourceQuery": seed + " (related/paa)"})
+            sl = s.lower().strip()
+            if not sl or sl in got:
+                continue
+            got.add(sl)
+            out_rows.append({"Keyword": s.strip(), "Seed": seed, "SourceQuery": seed + " (related/paa)"})
+            if len(out_rows) >= min_per_seed:
+                break
+
     return pd.DataFrame(out_rows)
 
 def parse_list(s: str):
@@ -271,6 +406,17 @@ def parse_list(s: str):
     parts = re.split(r"[,\n]+", s.strip())
     return [p.strip().lower() for p in parts if p.strip()]
 
+# ---------------------- Seeds & run ----------------------
+st.subheader("Seed Keywords")
+tab1, tab2 = st.tabs(["Single seed (Semrush-style explore)","Multiple seeds (batch)"])
+with tab1:
+    seed_single = st.text_input("Enter a single seed keyword", placeholder="e.g. whipper snipper")
+with tab2:
+    seeds_multi = st.text_area("Enter multiple seeds (one per line)", height=160, placeholder="e.g.\nwhipper snipper\nnail gun\nimpact driver")
+
+run_single = st.button("🔍 Explore Single Seed")
+run_multi = st.button("🚀 Run Batch")
+
 if run_single:
     if not seed_single.strip():
         st.warning("Please enter a seed keyword.")
@@ -278,7 +424,7 @@ if run_single:
     with st.spinner("Fetching suggestions…"):
         df = expand_seed(seed_single.strip())
     if df.empty:
-        st.warning("No suggestions found. Try different sources or increase breadth.")
+        st.warning("No suggestions found. Try different sources or increase breadth / relax attribute filters.")
         st.stop()
 
     # filters
@@ -358,6 +504,3 @@ if run_multi:
 
 st.markdown("---")
 st.caption("⚠️ Endpoints are unofficial. Use modest rates and consider proxies for larger runs. Some sources (e.g., Amazon) are regionally restricted.")
-
-st.caption(f"🌍 Country in use: **{country.upper()}**")
-
