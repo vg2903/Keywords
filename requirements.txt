@@ -1,7 +1,9 @@
 streamlit
-requests
 pandas
+requests
+beautifulsoup4
 scikit-learn
 sentence-transformers
 numpy
-beautifulsoup4
+openai
+pytrends
