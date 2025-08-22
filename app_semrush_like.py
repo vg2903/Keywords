@@ -358,3 +358,6 @@ if run_multi:
 
 st.markdown("---")
 st.caption("⚠️ Endpoints are unofficial. Use modest rates and consider proxies for larger runs. Some sources (e.g., Amazon) are regionally restricted.")
+
+st.caption(f"🌍 Country in use: **{country.upper()}**")
+
